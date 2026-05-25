@@ -6428,3 +6428,49 @@ Original filing (2026-04-18): the session emitted `SessionStart hook (completed)
 
 
 450. **`prompt` emits `kind:"missing_credentials"` JSON on STDERR (not stdout), leaving stdout at 0 bytes — automation pattern `output=$(claw prompt hello --output-format json)` captures nothing on auth-absent failure; `doctor` correctly surfaces `auth.status:"warn"` with `api_key_present:false` but exposes no `prompt_ready:false` field that automation can check before invoking `prompt`** — dogfooded 2026-05-16 by Jobdori on `a35ee9a0` in response to Clawhip pinpoint nudge at `1505208225321062521`. Exact reproduction (isolated env, no creds, fresh git repo, HEAD `a35ee9a0`): `timeout 5 env -i HOME=$ISOLATED_HOME PATH=$PATH CLAW_CONFIG_HOME=$PROBE/.claw-cfg claw prompt hello --output-format json > stdout.txt 2> stderr.txt` → stdout = **0 bytes**, stderr = 195 bytes containing `{"error":"missing Anthropic credentials…","exit_code":1,"hint":null,"kind":"missing_credentials","type":"error"}`, exit code 1. Confirms Gaebal's `1505208553793781792` pinpoint that `prompt` timeout + zero bytes was the prior state — HEAD `a35ee9a0` now correctly exits 1 with `kind:"missing_credentials"` **but the envelope is still routed to stderr** (issue #447 class, same class as prior entries #422, #435). **Contrast with `doctor`:** `claw doctor --output-format json 2>/dev/null` succeeds to stdout with `checks[auth].status:"warn"`, `api_key_present:false`, `auth_token_present:false` — but the auth check has no `prompt_ready:false` field. Automation that gates on `doctor` before invoking `prompt` must re-derive readiness from `api_key_present && auth_token_present` — there is no single canonical boolean. **Three compound problems:** (a) **stdout-empty on `--output-format json` failure**: same class as #447; `prompt`'s error envelope goes to stderr, not stdout. The canonical automation idiom `if ! result=$(claw prompt "q" --output-format json); then echo "$result" | jq .kind; fi` sees `$result=""` on failure — the jq call gets nothing. All `--output-format json` error paths must route JSON to stdout per #447 contract; (b) **`doctor` missing `prompt_ready` field**: `doctor --output-format json` already knows auth is absent (`api_key_present:false`) but surfaces no derived `prompt_ready:bool` or `prompt_blocked_reason:string` field. Automation must infer readiness from `api_key_present || auth_token_present || legacy_*_present` — a 5-field OR across legacy fields that is fragile as auth mechanisms evolve. A single `prompt_ready:false` (with `prompt_blocked_reason:"auth_missing"`) inside the `auth` check would give downstream a stable contract; (c) **`claw prompt` with no auth does no preflight and fires straight at the API**: the preflight check that `doctor` runs (auth discovery) is not reused by `prompt` to emit a fast typed error before attempting the network call. Both Gaebal's pinpoint (prompt hanging silently on older HEAD) and the current behavior (prompt hitting auth gate after a brief API attempt) stem from the same root: prompt does not short-circuit at the point where `doctor` already knows auth is absent. If `doctor` can emit `kind:"doctor"` with `auth.status:"warn"` in ~20ms without a network call, `prompt` should emit `kind:"missing_credentials"` in the same window and output it to stdout. **Required fix shape:** (a) `prompt --output-format json` must write the `kind:"missing_credentials"` JSON envelope to **stdout**, not stderr — same fix as #447 for all error envelopes; (b) add `prompt_ready:bool` and `prompt_blocked_reason:string|null` to the `auth` check in `doctor --output-format json`; derive it as `api_key_present || auth_token_present || legacy_saved_oauth_present`; (c) `prompt` must run the credential preflight check (same codepath as doctor's auth check) before attempting any API call and emit `{"kind":"missing_credentials","prompt_blocked_reason":"auth_missing"}` on **stdout** with exit 1 if the check fails; (d) `--output-format json` stdout routing fix must cover: `prompt`, `session list` (cross-ref #449), `skills uninstall` (cross-ref #431), `resume` (cross-ref #435), `acp serve` (cross-ref #443) — the full `kind:"missing_credentials"` class; (e) regression test: `claw prompt hello --output-format json` with no creds writes JSON to stdout (0 bytes stderr), exits 1, `kind:"missing_credentials"`, in under 200ms (no network attempt). **Why this matters:** `prompt` is the primary consumer entry point. Auth-absent failure routing to stderr breaks every automation wrapper that captures `$(claw prompt ... --output-format json)`. The `doctor` preflight metadata gap means auth-readiness checks require parsing 5 legacy fields instead of reading one boolean. Cross-references #447 (all JSON error envelopes on stderr), #449 (session list hits auth gate), #431 (skills uninstall hits auth gate), #357 (auth gate on local ops cluster), #422 (exit-code parity). Source: Jobdori live dogfood, `a35ee9a0`, 2026-05-16.
+
+690. **`bootstrap-plan --help --output-format json` is now correctly intercepted as help on current main, but the JSON help is message-only (`{kind, command, topic, message}`) while actual `bootstrap-plan --output-format json` exposes the ordered startup phase contract in `phases[]`; startup wrappers cannot discover phase names, ordering semantics, or local/auth behavior from help without invoking the plan and reverse-engineering the payload** — dogfooded 2026-05-25 for the 00:30 Clawhip nudge at message `1508265874824626176`, reproduced on a freshly rebuilt current `origin/main` binary (`git_sha f8e1bb726`) from `/tmp/cc-probe-main-2130`. Active claw-code sessions: none.
+
+    Reproduction:
+
+    ```bash
+    $ env -i HOME=/tmp/iso45/home PATH=/usr/bin:/bin TERM=dumb \
+        claw bootstrap-plan --help --output-format json
+    {
+      "command": "bootstrap-plan",
+      "kind": "help",
+      "message": "Bootstrap Plan\n  Usage            claw bootstrap-plan [--output-format <format>]\n  Purpose          list the ordered startup phases the CLI would execute before dispatch\n  Output           phase names (text) or structured phase list (json) — primary output is the plan itself\n  Formats          text (default), json\n  Related          claw doctor · claw status",
+      "topic": "bootstrap-plan"
+    }
+    ```
+
+    Actual bootstrap-plan JSON on the same binary is a structured startup ordering surface:
+
+    ```bash
+    $ claw bootstrap-plan --output-format json
+    {
+      "kind": "bootstrap-plan",
+      "phases": [
+        "CliEntry",
+        "FastPathVersion",
+        "StartupProfiler",
+        "SystemPromptFastPath",
+        "ChromeMcpFastPath",
+        "DaemonWorkerFastPath",
+        "BridgeFastPath",
+        "DaemonFastPath",
+        "BackgroundSessionFastPath",
+        "TemplateFastPath",
+        "EnvironmentRunnerFastPath",
+        "MainRuntime"
+      ]
+    }
+    ```
+
+    Help does not expose structured `output_fields`, `phase_order`, `phase_count`, `phase_values`, `ordering_semantics`, `local_only`, `requires_credentials:false`, `requires_provider_request:false`, or `mutates_workspace:false` fields.
+
+    **Why distinct from existing items:** #141 covered inconsistent `<subcommand> --help` behavior and specifically noted old `bootstrap-plan --help` printed phases instead of help. Current main has fixed that parser-level behavior: `bootstrap-plan --help --output-format json` returns a help object. #690 covers the next-layer schema-depth gap: the help object is prose-only and does not describe the startup phase contract. #325 is broad top-level help prose-wrapper; #686–#689 are sibling help-schema depth gaps for doctor/status/sandbox/ACP.
+
+    **Why this matters:** `bootstrap-plan` is a startup-order introspection command. Claws use it to reason about what can run before credentials, MCP, daemon/bridge startup, or prompt dispatch. The phase list is a contract: ordering and phase names must be discoverable without running the command first and treating one sample output as the schema. If a new phase is inserted, help/schema should make the change visible to wrappers.
+
+    **Required fix shape:** (a) Extend `bootstrap-plan --help --output-format json` with structured fields: `usage:"claw bootstrap-plan [--output-format <format>]"`, `formats:["text","json"]`, `related:["claw doctor","claw status"]`, `local_only:true`, `requires_credentials:false`, `requires_provider_request:false`, `mutates_workspace:false`, `output_fields:["kind","phases"]`, `phase_order:["CliEntry","FastPathVersion","StartupProfiler","SystemPromptFastPath","ChromeMcpFastPath","DaemonWorkerFastPath","BridgeFastPath","DaemonFastPath","BackgroundSessionFastPath","TemplateFastPath","EnvironmentRunnerFastPath","MainRuntime"]`, `phase_count:12`, `ordering_semantics:"execution_order_before_main_runtime"`, and `schema_version`. (b) Derive help phase metadata from the same phase registry/vector used by `bootstrap-plan` output so additions cannot drift. (c) Keep `message` as human summary only. **Acceptance check:** `claw bootstrap-plan --help --output-format json | jq -e '.command=="bootstrap-plan" and .local_only==true and .requires_credentials==false and ([.output_fields[]] | index("phases")) and (.phase_order[0] == "CliEntry") and (.ordering_semantics | type == "string")'` should pass; currently those structured fields are absent. Source: gaebal-gajae dogfood for the 2026-05-25 00:30 Clawhip nudge.
